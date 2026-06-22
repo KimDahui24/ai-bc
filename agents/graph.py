@@ -1,33 +1,40 @@
-from typing import TypedDict, Literal, Optional
+from typing import TypedDict, Literal, Annotated
+from operator import add
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
 
-from models.schemas import IntentResult, MovieAnswer
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMessage
+from langchain_openai import AzureChatOpenAI
+
+from models.schemas import IntentResult, FinalAnswer
 from services.llm_factory import get_chat_llm
-from services.tmdb_client import TMDbClient
-from services.rag_service import RAGService
+from services.tools import search_tmdb_movies, get_tmdb_movie_detail, search_local_knowledge
 from agents.prompts import (
     SUPERVISOR_PROMPT,
-    RETRIEVER_SUMMARY_PROMPT,
-    ANSWER_PROMPT,
+    TOOL_AGENT_COMMON,
+    RECOMMENDER_PROMPT,
+    INFO_PROMPT,
+    COMPARE_PROMPT,
+    REVIEW_PROMPT,
     REVIEWER_PROMPT,
 )
+
+TOOLS = [search_tmdb_movies, get_tmdb_movie_detail, search_local_knowledge]
 
 
 class AgentState(TypedDict, total=False):
     question: str
     intent: Literal["recommend", "info", "compare", "review"]
     intent_reason: str
-    tmdb_context: str
-    rag_context: str
-    merged_context: str
+    scratchpad: str
     draft_answer: str
     final_answer: str
+    messages: Annotated[list[BaseMessage], add]
 
 
 llm = get_chat_llm()
-tmdb = TMDbClient()
-rag = RAGService()
+tool_llm: AzureChatOpenAI = llm.bind_tools(TOOLS)
 
 
 def supervisor_node(state: AgentState) -> AgentState:
@@ -38,121 +45,128 @@ def supervisor_node(state: AgentState) -> AgentState:
             {"role": "user", "content": state["question"]},
         ]
     )
-    return {"intent": result.intent, "intent_reason": result.reason}
+    return {
+        "intent": result.intent,
+        "intent_reason": result.reason,
+        "messages": [AIMessage(content=f"intent={result.intent} / reason={result.reason}")]
+    }
 
 
-def retrieve_tmdb_node(state: AgentState) -> AgentState:
-    movies = tmdb.get_movie_candidates(state["question"])
-    lines = []
-    for movie in movies[:3]:
-        title = movie.get("title", "")
-        movie_id = movie.get("id")
-        if not movie_id:
-            continue
-        detail = tmdb.movie_details(movie_id)
-        lines.append(
-            f"""제목: {detail.get('title')}
-개봉일: {detail.get('release_date')}
-평점: {detail.get('vote_average')}
-장르: {", ".join([g.get("name", "") for g in detail.get("genres", [])])}
-줄거리: {detail.get('overview')}
-"""
+def route_by_intent(state: AgentState) -> str:
+    return state["intent"]
+
+
+def run_tool_loop(agent_instruction: str, user_question: str) -> str:
+    messages: list[BaseMessage] = [
+        HumanMessage(
+            content=f"{TOOL_AGENT_COMMON}\n\n{agent_instruction}\n\n사용자 질문: {user_question}"
         )
-    return {"tmdb_context": "\n---\n".join(lines) if lines else "TMDb 검색 결과 없음"}
+    ]
+
+    for _ in range(4):
+        ai_msg = tool_llm.invoke(messages)
+        messages.append(ai_msg)
+
+        tool_calls = getattr(ai_msg, "tool_calls", None)
+        if not tool_calls:
+            return ai_msg.content if isinstance(ai_msg.content, str) else str(ai_msg.content)
+
+        for call in tool_calls:
+            tool_name = call["name"]
+            tool_args = call.get("args", {})
+            selected_tool = next(t for t in TOOLS if t.name == tool_name)
+            tool_result = selected_tool.invoke(tool_args)
+            messages.append(
+                ToolMessage(
+                    content=str(tool_result),
+                    tool_call_id=call["id"],
+                )
+            )
+
+    return "도구 사용 후에도 충분한 답변을 생성하지 못했습니다."
 
 
-def retrieve_rag_node(state: AgentState) -> AgentState:
-    docs = rag.retrieve(state["question"], k=4)
-    context = "\n".join([f"- {doc.page_content}" for doc in docs]) if docs else "RAG 결과 없음"
-    return {"rag_context": context}
+def recommender_node(state: AgentState) -> AgentState:
+    draft = run_tool_loop(RECOMMENDER_PROMPT, state["question"])
+    return {"draft_answer": draft, "messages": [AIMessage(content=draft)]}
 
 
-def merge_context_node(state: AgentState) -> AgentState:
-    prompt = f"""
-{RETRIEVER_SUMMARY_PROMPT}
-
-[사용자 질문]
-{state['question']}
-
-[TMDb 결과]
-{state.get('tmdb_context', '')}
-
-[로컬 RAG 결과]
-{state.get('rag_context', '')}
-"""
-    result = llm.invoke(prompt).content
-    return {"merged_context": result}
+def info_node(state: AgentState) -> AgentState:
+    draft = run_tool_loop(INFO_PROMPT, state["question"])
+    return {"draft_answer": draft, "messages": [AIMessage(content=draft)]}
 
 
-def answer_node(state: AgentState) -> AgentState:
-    structured_llm = llm.with_structured_output(MovieAnswer)
-    result = structured_llm.invoke(
-        [
-            {"role": "system", "content": ANSWER_PROMPT},
-            {
-                "role": "user",
-                "content": f"""
-질문 유형: {state['intent']}
-사용자 질문: {state['question']}
+def compare_node(state: AgentState) -> AgentState:
+    draft = run_tool_loop(COMPARE_PROMPT, state["question"])
+    return {"draft_answer": draft, "messages": [AIMessage(content=draft)]}
 
-context:
-{state['merged_context']}
-""",
-            },
-        ]
-    )
 
-    draft = f"""질문 유형: {result.question_type}
-
-요약:
-{result.summary}
-
-핵심 포인트:
-""" + "\n".join([f"- {b}" for b in result.bullets]) + """
-
-추천/언급 영화:
-""" + "\n".join([f"- {t}" for t in result.recommended_titles]) + """
-
-근거:
-""" + "\n".join([f"- {e}" for e in result.evidence])
-
-    return {"draft_answer": draft}
+def review_node(state: AgentState) -> AgentState:
+    draft = run_tool_loop(REVIEW_PROMPT, state["question"])
+    return {"draft_answer": draft, "messages": [AIMessage(content=draft)]}
 
 
 def reviewer_node(state: AgentState) -> AgentState:
-    result = llm.invoke(
+    structured_llm = llm.with_structured_output(FinalAnswer)
+    result = structured_llm.invoke(
         [
             {"role": "system", "content": REVIEWER_PROMPT},
             {
                 "role": "user",
                 "content": f"""
-사용자 질문:
-{state['question']}
+질문 유형: {state['intent']}
+질문: {state['question']}
+초안: {state['draft_answer']}
 
-초안:
-{state['draft_answer']}
+최종 사용자 응답을 정제하세요.
 """,
             },
         ]
-    ).content
-    return {"final_answer": result}
+    )
+
+    final_text = f"""### 답변
+{result.answer}
+
+### 핵심 포인트
+""" + "\n".join([f"- {b}" for b in result.bullets]) + """
+
+### 근거
+""" + "\n".join([f"- {e}" for e in result.evidence])
+
+    if result.follow_up:
+        final_text += f"\n\n### 다음에 물어보면 좋은 질문\n- {result.follow_up}"
+
+    return {"final_answer": final_text, "messages": [AIMessage(content=final_text)]}
 
 
 def build_graph():
     builder = StateGraph(AgentState)
+
     builder.add_node("supervisor", supervisor_node)
-    builder.add_node("retrieve_tmdb", retrieve_tmdb_node)
-    builder.add_node("retrieve_rag", retrieve_rag_node)
-    builder.add_node("merge_context", merge_context_node)
-    builder.add_node("answer", answer_node)
+    builder.add_node("recommend_agent", recommender_node)
+    builder.add_node("info_agent", info_node)
+    builder.add_node("compare_agent", compare_node)
+    builder.add_node("review_agent", review_node)
     builder.add_node("reviewer", reviewer_node)
 
     builder.add_edge(START, "supervisor")
-    builder.add_edge("supervisor", "retrieve_tmdb")
-    builder.add_edge("retrieve_tmdb", "retrieve_rag")
-    builder.add_edge("retrieve_rag", "merge_context")
-    builder.add_edge("merge_context", "answer")
-    builder.add_edge("answer", "reviewer")
+
+    builder.add_conditional_edges(
+        "supervisor",
+        route_by_intent,
+        {
+            "recommend": "recommend_agent",
+            "info": "info_agent",
+            "compare": "compare_agent",
+            "review": "review_agent",
+        },
+    )
+
+    builder.add_edge("recommend_agent", "reviewer")
+    builder.add_edge("info_agent", "reviewer")
+    builder.add_edge("compare_agent", "reviewer")
+    builder.add_edge("review_agent", "reviewer")
     builder.add_edge("reviewer", END)
 
-    return builder.compile()
+    checkpointer = InMemorySaver()
+    return builder.compile(checkpointer=checkpointer)
