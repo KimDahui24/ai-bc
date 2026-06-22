@@ -1,4 +1,4 @@
-[Movie Mate – 김다희]
+    [Movie Mate – 김다희]
 
 1. 프로젝트 개요 – 기획 배경 및 핵심 내용
 
@@ -221,7 +221,7 @@ Tool Calling과 ReAct 구조는 추후 외부 영화 API 또는 파일 시스템
 3.2 시스템 구조도 / Multi-Agent 다이어그램
 
 아래와 같은 구조를 기준으로 설계하였습니다.
-
+```
 사용자
   ↓
 Streamlit UI
@@ -260,6 +260,7 @@ context 기반 응답 생성
 세션 기록 저장
 
 Add image
+```
 
 ⸻
 
