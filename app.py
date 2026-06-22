@@ -1,7 +1,13 @@
+import os
+import sys
 import uuid
 import streamlit as st
 
 from agents.graph import build_graph
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
 st.set_page_config(page_title="Movie Mate", page_icon="🎬", layout="wide")
 st.title("🎬 Movie Mate")
