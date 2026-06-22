@@ -9,18 +9,21 @@ BASE_URL = "https://api.themoviedb.org/3"
 
 class TMDbClient:
     def __init__(self):
-        self.api_key = os.getenv("TMDB_API_KEY")
-        if not self.api_key:
-            raise RuntimeError("TMDB_API_KEY 환경변수가 설정되지 않았습니다.")
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+        token = os.getenv("TMDB_BEARER_TOKEN") or os.getenv("TMDB_API_KEY")
+        if not token:
+            raise RuntimeError("TMDB_BEARER_TOKEN 또는 TMDB_API_KEY 환경변수가 필요합니다.")
+        self.token = token
+
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.token}",
             "accept": "application/json",
         }
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         response = requests.get(
             f"{BASE_URL}{path}",
-            headers=self.headers,
+            headers=self._headers(),
             params=params or {},
             timeout=20,
         )
@@ -36,27 +39,3 @@ class TMDbClient:
 
     def movie_details(self, movie_id: int, language: str = "ko-KR") -> dict:
         return self._get(f"/movie/{movie_id}", params={"language": language})
-
-    def discover_movies(
-        self,
-        with_genres: str | None = None,
-        sort_by: str = "popularity.desc",
-        language: str = "ko-KR",
-        page: int = 1,
-    ) -> list[dict]:
-        params = {"sort_by": sort_by, "language": language, "page": page}
-        if with_genres:
-            params["with_genres"] = with_genres
-        data = self._get("/discover/movie", params=params)
-        return data.get("results", [])
-
-    def get_movie_candidates(self, question: str) -> list[dict]:
-        """
-        간단한 검색 우선 전략:
-        1) 질문 전체로 search_movie
-        2) 결과 부족 시 discover fallback
-        """
-        results = self.search_movie(question)
-        if results:
-            return results[:5]
-        return self.discover_movies()[:5]
