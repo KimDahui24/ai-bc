@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -21,6 +22,36 @@ class RAGService:
             persist_directory=self.persist_dir,
         )
 
+    def _chunk_markdown(self, text: str) -> list[Document]:
+        sections = re.split(r"\n##\s+", text)
+        docs = []
+
+        for idx, sec in enumerate(sections):
+            sec = sec.strip()
+            if not sec:
+                continue
+
+            lines = sec.splitlines()
+            title = lines[0].replace("#", "").strip()
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+
+            paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+            if not paragraphs:
+                paragraphs = [body] if body else []
+
+            for p_idx, paragraph in enumerate(paragraphs):
+                docs.append(
+                    Document(
+                        page_content=f"[{title}] {paragraph}",
+                        metadata={
+                            "section": title,
+                            "chunk_index": p_idx,
+                            "source": self.data_path,
+                        },
+                    )
+                )
+        return docs
+
     def ingest_if_needed(self):
         existing = self.vectorstore.get()
         if existing and existing.get("ids"):
@@ -28,29 +59,17 @@ class RAGService:
 
         path = Path(self.data_path)
         if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                """# Movie Mate Local Notes
-
-인터스텔라는 감성적인 SF, 가족 서사, 우주 탐사 키워드가 강하다.
-인셉션은 복잡한 구조, 꿈, 해석의 재미, 몰입감이 강한 영화다.
-기생충은 계층, 블랙코미디, 사회 풍자, 긴장감이 핵심이다.
-라라랜드는 사랑, 꿈, 뮤지컬, 색감, 감성적 여운이 특징이다.
-위플래시는 집착, 경쟁, 음악, 긴장감이 매우 강하다.
-인사이드 아웃은 가족, 성장, 감정 교육, 힐링에 적합하다.
-""",
-                encoding="utf-8",
-            )
+            raise FileNotFoundError(f"RAG 데이터 파일이 없습니다: {self.data_path}")
 
         raw = path.read_text(encoding="utf-8")
-        chunks = [chunk.strip() for chunk in raw.split("\n") if chunk.strip()]
-        docs = [
-            Document(page_content=chunk, metadata={"source": str(path)})
-            for chunk in chunks
-        ]
-        self.vectorstore.add_documents(docs)
+        docs = self._chunk_markdown(raw)
+        if docs:
+            self.vectorstore.add_documents(docs)
 
-    def retrieve(self, query: str, k: int = 4) -> list[Document]:
+    def retrieve(self, query: str, k: int = 4, section: str | None = None):
         self.ingest_if_needed()
-        retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
+        search_kwargs = {"k": k}
+        if section:
+            search_kwargs["filter"] = {"section": section}
+        retriever = self.vectorstore.as_retriever(search_kwargs=search_kwargs)
         return retriever.invoke(query)
