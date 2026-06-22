@@ -26,7 +26,7 @@ class RAGService:
         sections = re.split(r"\n##\s+", text)
         docs = []
 
-        for idx, sec in enumerate(sections):
+        for sec in sections:
             sec = sec.strip()
             if not sec:
                 continue
@@ -36,16 +36,16 @@ class RAGService:
             body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
 
             paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-            if not paragraphs:
-                paragraphs = [body] if body else []
+            if not paragraphs and body:
+                paragraphs = [body]
 
-            for p_idx, paragraph in enumerate(paragraphs):
+            for idx, paragraph in enumerate(paragraphs):
                 docs.append(
                     Document(
                         page_content=f"[{title}] {paragraph}",
                         metadata={
                             "section": title,
-                            "chunk_index": p_idx,
+                            "chunk_index": idx,
                             "source": self.data_path,
                         },
                     )
@@ -66,10 +66,80 @@ class RAGService:
         if docs:
             self.vectorstore.add_documents(docs)
 
-    def retrieve(self, query: str, k: int = 4, section: str | None = None):
+    def _keyword_overlap_score(self, query: str, text: str) -> int:
+        q_tokens = set(query.lower().split())
+        t_tokens = set(text.lower().split())
+        return len(q_tokens.intersection(t_tokens))
+
+    def _rerank(self, query: str, docs_with_scores: list[tuple[Document, float]]) -> list[tuple[Document, float]]:
+        reranked = []
+        for doc, score in docs_with_scores:
+            overlap = self._keyword_overlap_score(query, doc.page_content)
+            final_score = score + (overlap * 0.03)
+            reranked.append((doc, final_score))
+        reranked.sort(key=lambda x: x[1], reverse=True)
+        return reranked
+
+    def retrieve(
+        self,
+        query: str,
+        k: int = 4,
+        section: str | None = None,
+        search_type: str = "mmr",
+        score_threshold: float = 0.2,
+    ) -> list[Document]:
         self.ingest_if_needed()
-        search_kwargs = {"k": k}
-        if section:
-            search_kwargs["filter"] = {"section": section}
-        retriever = self.vectorstore.as_retriever(search_kwargs=search_kwargs)
-        return retriever.invoke(query)
+
+        filter_dict = {"section": section} if section else None
+
+        docs: list[Document] = []
+
+        if search_type == "mmr":
+            retriever = self.vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    "k": k,
+                    "fetch_k": max(k * 2, 8),
+                    **({"filter": filter_dict} if filter_dict else {}),
+                },
+            )
+            docs = retriever.invoke(query)
+        else:
+            results = self.vectorstore.similarity_search_with_relevance_scores(
+                query,
+                k=max(k * 2, 8),
+                filter=filter_dict,
+            )
+            filtered = [(doc, score) for doc, score in results if score >= score_threshold]
+            reranked = self._rerank(query, filtered)
+            docs = [doc for doc, _ in reranked[:k]]
+
+        if not docs and section:
+            retriever = self.vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": k, "fetch_k": max(k * 2, 8)},
+            )
+            docs = retriever.invoke(query)
+
+        return docs
+
+    def retrieve_multi_query(
+        self,
+        queries: list[str],
+        k: int = 5,
+        section: str | None = None,
+    ) -> list[Document]:
+        self.ingest_if_needed()
+
+        merged: list[Document] = []
+        seen = set()
+
+        for q in queries:
+            docs = self.retrieve(q, k=k, section=section, search_type="similarity")
+            for doc in docs:
+                key = (doc.page_content, str(doc.metadata))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(doc)
+
+        return merged[:k]
