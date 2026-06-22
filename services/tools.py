@@ -1,3 +1,4 @@
+from typing import Optional
 from langchain_core.tools import tool
 
 from services.tmdb_client import TMDbClient
@@ -37,9 +38,19 @@ def get_tmdb_movie_detail(movie_id: int) -> str:
 
 
 @tool
-def search_local_knowledge(query: str) -> str:
+def search_local_knowledge(query: str, section: Optional[str] = None) -> str:
     """로컬 영화 노트(RAG)에서 관련 지식을 검색한다."""
-    docs = rag.retrieve(query, k=4)
+    docs = rag.retrieve(query=query, k=4, section=section, search_type="similarity")
     if not docs:
         return "로컬 지식 검색 결과 없음"
+    return "\n".join([f"- {doc.page_content}" for doc in docs])
+
+
+@tool
+def search_local_knowledge_multi(query1: str, query2: str = "", query3: str = "", section: Optional[str] = None) -> str:
+    """여러 확장 쿼리로 로컬 지식을 재검색한다."""
+    queries = [q for q in [query1, query2, query3] if q]
+    docs = rag.retrieve_multi_query(queries=queries, k=5, section=section)
+    if not docs:
+        return "다중 쿼리 검색 결과 없음"
     return "\n".join([f"- {doc.page_content}" for doc in docs])
